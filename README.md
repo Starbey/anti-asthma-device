@@ -1,2 +1,6 @@
 # ece198_1_4
-ECE198 repository
+V2 changes:
+- Use modulo arithmetic to appropriately round data
+- Set up microsecond timer
+- Test with active buzzer
+- Allow LCD mode switching
