@@ -1,38 +1,41 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * ECE190.c
-
-  * This program demonstrates how to interface with a HD44780 LCD, a DHT22
-  * humidity and temperature sensor, and a particle sensor. It contains a
-  * modification of the code in:
-  * https://adastra-soft.com/hd44780-library-for-stm32/ to interface with the
-  * HD44780.
-  *
-  * Pin assignments:
-  * RS            PB10
-  * RW            PA8
-  * E_PULSE       PA9
-  * DB4           PB6
-  * DB5           PA7
-  * DB6           PA6
-  * DB7           PA5
-  * DHT22         PA10
-  8 P_SENSOR_SDA  PB9
-  * P_SENSOR_SCL  PB8
-  *
-  * USART2_TX   PA2 - for debugging so you can print to console
-  * USART2_RX   PA3 - for debugging so you can print to console
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
+******************************************************************************
+* @file           : main.c
+* @brief          : Main program body
+******************************************************************************
+* @attention
+*
+* ECE198
+* This program demonstrates how to interface with a HD44780 LCD, a DHT22
+* humidity and temperature sensor, and a particle sensor. It contains a
+* modification of the code in:
+* https://adastra-soft.com/hd44780-library-for-stm32/ to interface with the
+* HD44780.
+*
+* Pin assignments:
+* RS            PB10
+* RW            PA8
+* E_PULSE       PA9
+* DB4           PB6
+* DB5           PA7
+* DB6           PA6
+* DB7           PA5
+*
+* DHT22         PA10
+*
+* P_SENSOR_SDA  PB9
+* P_SENSOR_SCL  PB8
+*
+* BUZZER        PB4
+*
+* BUTTON        PC13
+*
+* USART2_TX   PA2 - for debugging so you can print to console
+* USART2_RX   PA3 - for debugging so you can print to console
+*
+******************************************************************************
+*/
 #include "main.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,31 +57,52 @@
 #define LCD_DB7_PIN LCD_DB7_Pin
 #define DHT22_PORT GPIOA
 #define DHT22_PIN DHT22_Pin
+#define BUZZER_PORT GPIOB
+#define BUZZER_PIN BUZZER_PIN
+#define BUTTON_PORT BUTTON_GPIO_Port
+#define BUTTON_PIN BUTTON_Pin
 
 #define PIN_CLEAR GPIO_PIN_RESET
 #define PIN_SET GPIO_PIN_SET
 #define DOWN 0
 #define UP 1
+#define TRUE 1
+#define FALSE 0
 
-#define MAX_CHARS 20
-#define MAX_SPACE 16
+#define MAX_CHARS 16
+#define NUM_LINES 5
 
-#define LABEL1 "Humid: "
-#define LABEL2 "Temp : "
-#define LABEL3 "Dust : "
-#define POLL_INTERVAL 30000000
+#define PS_ADDR 0x33
+
+#define LABEL1 "Temp :"
+#define LABEL2 "Humid:"
+#define LABEL3 "PM1  :"
+#define LABEL4 "PM2.5:"
+#define LABEL5 "PM10 :"
+#define LCD_ROW1 0
+#define LCD_ROW2 192
+
+#define SCREEN_DELAY 5000000
+#define POLL_INTERVAL 30000000 /* must be greater than SCREEN_DELAY */
 
 /******************************* data structures ******************************/
-struct data_t
+struct dht_data_t
 {
   uint16_t rh;
   uint16_t temp;
   uint8_t integrity; /* 0 is good; other values are bad. */
 };
 
+struct ps_data_t
+{
+    uint32_t pm1_0;
+    uint32_t pm2_5;
+    uint32_t pm10;
+    uint8_t error;
+};
+
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
-RTC_HandleTypeDef hrtc;
 TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart2;
 
@@ -86,7 +110,6 @@ UART_HandleTypeDef huart2;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
-static void MX_RTC_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART2_UART_Init(void);
 
@@ -100,7 +123,13 @@ void not_busy(void);
 void set_pin_input(GPIO_TypeDef *, uint16_t, uint8_t);
 void set_pin_output(GPIO_TypeDef *, uint16_t);
 void print_message(char *);
-void poll_dht22(GPIO_TypeDef *, uint16_t, struct data_t *);
+void prep_output(char [NUM_LINES][MAX_CHARS], struct dht_data_t *,
+                struct ps_data_t *);
+
+void poll_dht22(GPIO_TypeDef *, uint16_t, struct dht_data_t *);
+
+void poll_psensor(uint16_t, struct ps_data_t *);
+uint32_t parse_psensor_data(uint8_t, uint8_t, uint8_t, uint8_t);
 
 #ifdef __GNUC__
 #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
@@ -114,78 +143,66 @@ PUTCHAR_PROTOTYPE
   return ch;
 }
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
+/************************************* main ***********************************/
 int main(void)
 {
-  char  label1[MAX_CHARS] = LABEL1,
-        label2[MAX_CHARS] = LABEL2,
-        label3[MAX_CHARS] = LABEL3,
-        dht_value[10];
-  struct data_t *data = calloc(1, sizeof(struct data_t));
-  uint8_t lcd_home = 128;
+  char item[NUM_LINES][MAX_CHARS];
+  struct dht_data_t *dht_data = calloc(1, sizeof(struct dht_data_t));
+  struct ps_data_t *ps_data = calloc(1, sizeof(struct ps_data_t));
+  uint8_t i, j = 0;
 
   /*Reset of all peripherals, Initializes the Flash interface and the Systick.*/
   HAL_Init();
-
-  /* Configure the system clock */
-  SystemClock_Config();
+  SystemClock_Config(); /* Configure the system clock */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_I2C1_Init();
-  MX_RTC_Init();
   MX_TIM2_Init();
   MX_USART2_UART_Init();
 
   HAL_TIM_Base_Start(&htim2); /* needed by the microsecond timer */
-  init_lcd();
 
   delay_us(3000000); /* initial delay after on */
 
-  while (1) /* Infinite loop */
+  while (1)
   {
-    HAL_TIM_Base_Start(&htim2); /* needed by the microsecond timer */
+    poll_dht22(DHT22_PORT, DHT22_PIN, dht_data);  /* get the RH and TEMP */
+    poll_psensor(PS_ADDR, ps_data);  /* get the particle counts */
+printf("debug30: %u, %u, %u\n\r", ps_data->pm1_0, ps_data->pm2_5, ps_data->pm10);
 
-    send_lcd_command(lcd_home);
-    print_message(label1);
-    send_lcd_command(lcd_home + 64); /* move the cursor to the 2nd row */
-    print_message(label2);
+    /* analyze ps_data and beep if it is bad */
 
-    poll_dht22(DHT22_PORT, DHT22_PIN, data);
+    /* scroll output to the 1602 LCD */
+    prep_output(item, dht_data, ps_data);
 
-    send_lcd_command(128 + strlen(label1) + 1);
-    if(data->integrity == 0)
+    for(i = 0; i < NUM_LINES; i++)
     {
-      sprintf(dht_value, "%d.%d%%", (uint16_t)(data->rh / 10),
-              (uint16_t)(data->rh % 10));
-    }
-    else
-    {
-      sprintf(dht_value, "N.A.");
-    }
-    print_message(dht_value);
+      j = j % NUM_LINES;
+      init_lcd();
+      send_lcd_command(LCD_ROW1);
+      print_message(item[j]);
+      send_lcd_command(LCD_ROW2);
 
-    send_lcd_command(192 + strlen(label2) + 1);
-    if(data->integrity == 0)
-    {
-      sprintf(dht_value, "%d.%dC", (int16_t)(data->temp / 10),
-              (uint16_t)(data->temp % 10));
+      print_message(item[(j + 1) % NUM_LINES]);  /* OK to reprint TEMP */
+
+      if(j++ >= NUM_LINES)
+      {
+        j = 0;
+      }
+      delay_us(SCREEN_DELAY);
+      //poll_delay(POLL_INTERVAL, BUTTON_PORT, BUTTON_PIN);
     }
-    else
-    {
-      sprintf(dht_value, "N.A.");
-    }
-    print_message(dht_value);
-    delay_us(POLL_INTERVAL);
+    delay_us(POLL_INTERVAL - NUM_LINES * SCREEN_DELAY);
+    //poll_delay(POLL_INTERVAL - SCREEN_DELAY, BUTTON_PORT, BUTTON_PIN);
   }
 
-  free(data);
+  free(dht_data);
+  free(ps_data);
   return(0);
-
 }
+
+/******************************************************************************/
 
 /**
   * @brief System Clock Configuration
@@ -204,11 +221,9 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|
-                                      RCC_OSCILLATORTYPE_LSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 16;
@@ -255,48 +270,7 @@ static void MX_I2C1_Init(void)
   {
     Error_Handler();
   }
-}
 
-/**
-  * @brief RTC Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_RTC_Init(void)
-{
-  RTC_TimeTypeDef sTime = {0};
-  RTC_DateTypeDef sDate = {0};
-
-  hrtc.Instance = RTC;
-  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
-  hrtc.Init.AsynchPrediv = 127;
-  hrtc.Init.SynchPrediv = 255;
-  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
-  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
-  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
-  if (HAL_RTC_Init(&hrtc) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  sTime.Hours = 0x0;
-  sTime.Minutes = 0x0;
-  sTime.Seconds = 0x0;
-  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
-  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
-  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sDate.WeekDay = RTC_WEEKDAY_MONDAY;
-  sDate.Month = RTC_MONTH_JANUARY;
-  sDate.Date = 0x1;
-  sDate.Year = 0x0;
-
-  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
-  {
-    Error_Handler();
-  }
 }
 
 /**
@@ -351,7 +325,6 @@ static void MX_USART2_UART_Init(void)
   {
     Error_Handler();
   }
-
 }
 
 /**
@@ -364,6 +337,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitTypeDef GPIO_InitStruct = {0};
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
@@ -372,7 +346,13 @@ static void MX_GPIO_Init(void)
                           |LCD_E_Pin|DHT22_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, LCD_RS_Pin|LCD_DB4_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, LCD_RS_Pin|BUZZER_Pin|LCD_DB4_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : BUTTON_Pin */
+  GPIO_InitStruct.Pin = BUTTON_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(BUTTON_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : LCD_DB7_Pin LCD_DB6_Pin LCD_DB5_Pin LCD_RW_Pin
                            LCD_E_Pin DHT22_Pin */
@@ -383,15 +363,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : LCD_RS_Pin LCD_DB4_Pin */
-  GPIO_InitStruct.Pin = LCD_RS_Pin|LCD_DB4_Pin;
+  /*Configure GPIO pins : LCD_RS_Pin BUZZER_Pin LCD_DB4_Pin */
+  GPIO_InitStruct.Pin = LCD_RS_Pin|BUZZER_Pin|LCD_DB4_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
 }
-
 /**
   * @brief  This function is executed in case of error occurrence.
   * @retval None
@@ -558,10 +536,9 @@ void not_busy(void)
   {
     e_pulse();
   }
-
   HAL_GPIO_WritePin(LCD_RW_PORT, LCD_RW_PIN, PIN_CLEAR);
-
   set_pin_output(LCD_DB7_PORT, LCD_DB7_PIN);
+
   return;
 }
 
@@ -617,8 +594,52 @@ void print_message(char *message)
   return;
 }
 
+void prep_output(char items[NUM_LINES][MAX_CHARS], struct dht_data_t *dht,
+                struct ps_data_t *ps)
+{
+  char rh[MAX_CHARS / 2], temp[MAX_CHARS / 2], pm1_0[MAX_CHARS / 2],
+       pm2_5[MAX_CHARS], pm10[MAX_CHARS];
+
+  /* convert data from sensors to strings */
+  if(dht->integrity == 0) /* DHT data is good */
+  {
+    sprintf(rh, "%d.%d%%", (dht->rh / 10), (dht->rh % 10));
+    sprintf(temp, "%d.%dC", (dht->temp / 10), (dht->temp % 10));
+  }
+  else /* DHT data is bad */
+  {
+    sprintf(rh, "N.A.");
+    sprintf(temp, "N.A.");
+  }
+
+  if(ps->error == FALSE) /* psensor data is good */
+  {
+    sprintf(pm1_0, "%u.%u", (unsigned int)(ps->pm1_0 / 1000),
+                            (unsigned int)(ps->pm1_0 % 1000));
+    sprintf(pm2_5, "%u.%u", (unsigned int)(ps->pm2_5 / 1000),
+                            (unsigned int)(ps->pm2_5 % 1000));
+    sprintf(pm10, "%u.%u", (unsigned int)(ps->pm10 / 1000),
+                           (unsigned int)(ps->pm10 % 1000));
+  }
+  else /* psensor data is bad */
+  {
+    sprintf(pm1_0, "N.A.");
+    sprintf(pm2_5, "N.A.");
+    sprintf(pm10, "N.A.");
+  }
+
+  /* format the lines to display */
+  sprintf(items[0], "%s %s", LABEL1, temp);
+  sprintf(items[1], "%s %s", LABEL2, rh);
+  sprintf(items[2], "%s %s", LABEL3, pm1_0);
+  sprintf(items[3], "%s %s", LABEL4, pm2_5);
+  sprintf(items[4], "%s %s", LABEL5, pm10);
+
+  return;
+}
+
 /****************************** DHT22 functions *******************************/
-void poll_dht22(GPIO_TypeDef *port, uint16_t pin, struct data_t *data)
+void poll_dht22(GPIO_TypeDef *port, uint16_t pin, struct dht_data_t *data)
 {
   uint32_t elapsed, databits = 0;
   uint8_t checksum = 0;
@@ -652,7 +673,7 @@ void poll_dht22(GPIO_TypeDef *port, uint16_t pin, struct data_t *data)
       elapsed++;
     }
     //printf("debug: elapsed time = %ld\n\r", elapsed);
-    if(i < 32) /* has no hit checksum */
+    if(i < 32) /* has no checksum */
     {
       databits = databits << 1;
       if(elapsed > 25) /* longer than 50 microseconds means bit is 1*/
@@ -681,9 +702,52 @@ void poll_dht22(GPIO_TypeDef *port, uint16_t pin, struct data_t *data)
                     + (data->temp >> 8) + (data->temp & 0xff)
                     - checksum;
 
-
   set_pin_output(port, pin);
   HAL_GPIO_WritePin(port, pin, PIN_SET); /* required for DHT22 */
 
   return;
+}
+
+/*********************** SN-GCJA5 PSensor Functions ***************************/
+void poll_psensor(uint16_t psensor_addr, struct ps_data_t *data)
+{
+  uint8_t rawdata[12], test[12];
+  uint32_t temp;
+  HAL_StatusTypeDef ret;
+
+  ret = HAL_I2C_Mem_Read(&hi2c1, (psensor_addr << 1), (uint16_t)0,
+                          I2C_MEMADD_SIZE_8BIT, rawdata, 12, HAL_MAX_DELAY);
+  if(ret != HAL_OK)
+  {
+    data->error = TRUE;
+  }
+  else
+  {
+    data->pm1_0 = parse_psensor_data(rawdata[0], rawdata[1],
+                                      rawdata[2], rawdata[3]);
+    data->pm2_5 = parse_psensor_data(rawdata[4], rawdata[5],
+                                      rawdata[6], rawdata[7]);
+    data->pm10 = parse_psensor_data(rawdata[8], rawdata[9],
+                                      rawdata[10], rawdata[11]);
+    data->error = FALSE;
+  }
+
+  ret = HAL_I2C_Mem_Read(&hi2c1, (psensor_addr << 1), (uint16_t)0x10,
+                          I2C_MEMADD_SIZE_8BIT, test, 12, HAL_MAX_DELAY);
+  temp = parse_psensor_data(test[0], test[1], test[2], test[3]);
+  printf("debug800: 1.0 - 5.0 = %lu\n\r", temp);
+
+  return;
+}
+
+uint32_t parse_psensor_data(uint8_t d1, uint8_t d2, uint8_t d3, uint8_t d4)
+{
+  uint32_t value = 0x0;
+
+  value = (uint32_t)d1;
+  value = value | (uint32_t)d2 << 8;
+  value = value | (uint32_t)d3 << 16;
+  value = value | (uint32_t)d4 << 24;
+
+  return(value);
 }
